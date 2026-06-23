@@ -52,6 +52,41 @@ class CliTests(unittest.TestCase):
             self.assertEqual(len(result["changes"]), 2)
             self.assertEqual(result["signals"][0]["rtl"]["reason"], "authority-not-provided")
 
+    def test_multiple_waveforms_require_an_explicit_choice(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shutil.copy2(FIXTURE, root / "older.vcd")
+            shutil.copy2(FIXTURE, root / "newer.vcd")
+            inspected = json.loads(invoke("inspect", "--workspace", str(root), "--json").stdout)
+            self.assertIsNone(inspected["waveform"]["selected"])
+            self.assertEqual(inspected["waveform"]["selection"], "explicit --waveform required: multiple candidates found")
+            self.assertEqual(len(inspected["waveform"]["candidates"]), 2)
+            self.assertIn("modified_at", inspected["waveform"]["candidates"][0])
+            rejected = invoke("scopes", "--workspace", str(root), check=False)
+            self.assertEqual(rejected.returncode, 2)
+            self.assertIn("multiple waveform candidates found", rejected.stderr)
+
+    def test_literal_match_regex_and_hierarchy_suggestions_are_explicit(self) -> None:
+        common = ("--workspace", str(ROOT / "tests/fixtures"), "--waveform", str(FIXTURE), "--json")
+        literal = json.loads(invoke("signals", *common, "--match", "valid|clk").stdout)
+        self.assertEqual(literal["count"], 0)
+        self.assertEqual(literal["matching"]["match"], "case-insensitive literal substring; repeated --match terms are ANDed")
+        regex = json.loads(invoke("signals", *common, "--regex", "valid|clk").stdout)
+        self.assertGreaterEqual(regex["count"], 2)
+        scopes = json.loads(invoke("scopes", *common, "--scope", "top_tb.dut").stdout)
+        self.assertEqual(scopes["scopes"], [])
+        self.assertIn("top_tb.u_dut", scopes["suggestions"])
+
+    def test_snapshot_table_uses_clock_edges(self) -> None:
+        result = invoke(
+            "probe", "--workspace", str(ROOT / "tests/fixtures"), "--waveform", str(FIXTURE),
+            "--scope", "top_tb.u_dut", "--start", "0ns", "--end", "20ns",
+            "--match", "valid", "--signal", "top_tb.u_dut.clk", "--clock", "top_tb.u_dut.clk",
+            "--format", "table", "--view", "snapshots",
+        )
+        self.assertIn("5ns", result.stdout)
+        self.assertIn("top_tb.u_dut.valid_o=0", result.stdout)
+
     def test_metadata_cache_invalidates_with_waveform(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

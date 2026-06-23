@@ -43,8 +43,15 @@ python "$CLI" inspect --json
 python "$CLI" scopes --json
 python "$CLI" signals --scope tb.dut --match valid --json
 python "$CLI" probe --around 420ns --radius 30ns \
-  --scope tb.dut --signal tb.dut.clk --clock tb.dut.clk
+  --scope tb.dut --signal tb.dut.clk --clock tb.dut.clk \
+  --format table --view snapshots
 ```
+
+Waveform auto-discovery is deliberately conservative: if more than one `.fst` or `.vcd` exists, `inspect` lists paths, sizes, and UTC modification times but does not select one. Other waveform-reading commands require `--waveform PATH` in that case. Re-run the failure first; never assume a pre-existing waveform belongs to that run.
+
+`--match` is a case-insensitive literal substring and repeated terms are ANDed. To match alternatives, use `--regex '<alternative-1>|<alternative-2>'`. Empty `scopes` and `signals` results include fuzzy hierarchy suggestions. `--top` is accepted by source/elaboration commands (`inspect`, `probe`, `packet`, `authority`), not `scopes` or `signals`, which always expose the waveform's real elaborated paths.
+
+`probe --clock ...` returns post-delta clock-edge snapshots in JSON; `--format table --view snapshots` makes those rows directly readable. All timestamps in a probe use the waveform's declared timescale unit.
 
 Map selected activity back to RTL:
 

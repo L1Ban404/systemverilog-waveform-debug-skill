@@ -156,12 +156,9 @@ def parse_time(value: str | int, timescale: Timescale) -> int:
 
 
 def format_time(ticks: int, timescale: Timescale) -> dict[str, int | str]:
-    total_fs = ticks * timescale.tick_fs
-    for unit in ("s", "ms", "us", "ns", "ps", "fs"):
-        factor = UNIT_FS[unit]
-        if total_fs >= factor and total_fs % factor == 0:
-            return {"ticks": ticks, "display": f"{total_fs // factor}{unit}"}
-    return {"ticks": ticks, "display": f"{total_fs}fs"}
+    # Keep one physical unit for an entire query. Mixed ns/ps logs are compact,
+    # but make cycle-by-cycle reading needlessly error-prone.
+    return {"ticks": ticks, "display": f"{ticks * timescale.factor}{timescale.unit}"}
 
 
 def iter_changes(path: Path, watched_ids: set[str]) -> Iterator[tuple[int, str, str]]:

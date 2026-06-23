@@ -9,9 +9,9 @@ import sys
 from typing import Any
 
 from . import SCHEMA_VERSION, TOOL_VERSION
-from .analysis import cache_key, compare_waveforms, infer_roles, probe, select_signals, signal_value
+from .analysis import cache_key, compare_waveforms, infer_roles, probe, select_signals, signal_value, suggest_paths
 from .authority import authority_diagnostics, authority_fingerprint, build_authority
-from .project import SourceManifest, infer_top, module_candidates, resolve_waveform, source_manifest
+from .project import SourceManifest, infer_top, module_candidates, resolve_waveform, source_manifest, waveform_candidates
 from .vcd import parse_time
 from .wave import open_waveform, pywellen_diagnostics
 
@@ -43,6 +43,7 @@ def _add_source_inputs(parser: argparse.ArgumentParser) -> None:
 def _paths(args: argparse.Namespace) -> tuple[Path, Path, Path, list[Path]]:
     workspace = args.workspace.resolve()
     waveform, candidates = resolve_waveform(workspace, args.waveform)
+    assert waveform is not None
     output = args.out_dir or Path("build/wave-debug")
     output = output if output.is_absolute() else workspace / output
     return workspace, waveform, output, candidates
@@ -68,6 +69,16 @@ def _top(args: argparse.Namespace, manifest: SourceManifest, wave: Any, waveform
         rendered = ", ".join(candidates) if candidates else "<none>"
         raise ValueError(f"top module is ambiguous; pass --top (candidates: {rendered})")
     return selected, candidates
+
+
+def _top_selection(args: argparse.Namespace, candidates: list[str], selected: str | None) -> str:
+    if args.top:
+        return "explicit --top"
+    if selected is None:
+        return "none: pass --top when source/elaboration needs a top"
+    if len(candidates) == 1:
+        return "only discovered source top candidate"
+    return "unique discovered source top candidate matching a waveform root scope"
 
 
 def _authority_db(args: argparse.Namespace, workspace: Path, output: Path, top: str | None) -> Path | None:
@@ -110,7 +121,31 @@ def _doctor(as_json: bool) -> int:
 
 
 def _inspect(args: argparse.Namespace) -> int:
-    workspace, waveform, output, candidates = _paths(args)
+    workspace = args.workspace.resolve()
+    waveform, candidates = resolve_waveform(workspace, args.waveform, allow_ambiguous=True)
+    output = args.out_dir or Path("build/wave-debug")
+    output = output if output.is_absolute() else workspace / output
+    candidate_rows = waveform_candidates(candidates)
+    if waveform is None:
+        result = {
+            "schema_version": SCHEMA_VERSION,
+            "workspace": str(workspace),
+            "waveform": {
+                "selected": None,
+                "selection": "explicit --waveform required: multiple candidates found",
+                "candidates": candidate_rows,
+            },
+            "output_dir": str(output),
+            "next_command": "rerun the failed test, then pass its new waveform with --waveform PATH",
+        }
+        if args.json:
+            print(_json(result), end="")
+        else:
+            print("waveform: <none; explicit selection required>")
+            for row in candidate_rows:
+                print(f"candidate: {row['path']}  modified={row['modified_at']}  size={row['size_bytes']}")
+            print(f"next: {result['next_command']}")
+        return 0
     wave = open_waveform(waveform, skill_root(), output)
     manifest = _manifest(args, workspace)
     selected_top, top_candidates = _top(args, manifest, wave, waveform, False)
@@ -119,9 +154,10 @@ def _inspect(args: argparse.Namespace) -> int:
         "workspace": str(workspace),
         "waveform": {
             "selected": str(waveform),
+            "selection": "explicit --waveform" if args.waveform else "only waveform candidate",
             "format": wave.format,
             "backend": wave.backend,
-            "candidates": [str(path) for path in candidates[:10]],
+            "candidates": candidate_rows,
         },
         "timescale": wave.header.timescale.as_dict(),
         "hierarchy": {"scope_count": len(wave.header.scopes), "signal_count": len(wave.header.signals)},
@@ -133,6 +169,7 @@ def _inspect(args: argparse.Namespace) -> int:
         },
         "top_candidates": top_candidates,
         "selected_top": selected_top,
+        "top_selection": _top_selection(args, top_candidates, selected_top),
         "role_candidates": infer_roles(wave.header.signals),
         "output_dir": str(output),
     }
@@ -143,6 +180,7 @@ def _inspect(args: argparse.Namespace) -> int:
         print(f"waveform: {waveform}")
         print(f"waveform-format: {wave.format}")
         print(f"waveform-backend: {wave.backend}")
+        print(f"waveform-selection: {result['waveform']['selection']}")
         print(f"waveform-candidates: {len(candidates)}")
         print(f"timescale: {wave.header.timescale.factor}{wave.header.timescale.unit}")
         print(f"scopes: {len(wave.header.scopes)}")
@@ -150,6 +188,7 @@ def _inspect(args: argparse.Namespace) -> int:
         print(f"hdl-files: {len(manifest.files)}")
         print(f"top-candidates: {', '.join(top_candidates) if top_candidates else '<none>'}")
         print(f"selected-top: {selected_top or '<ambiguous>'}")
+        print(f"top-selection: {result['top_selection']}")
         print(f"output-dir: {output}")
     return 0
 
@@ -158,24 +197,38 @@ def _scopes(args: argparse.Namespace) -> int:
     _workspace, waveform, output, _ = _paths(args)
     wave = open_waveform(waveform, skill_root(), output)
     scope = args.scope[4:] if args.scope and args.scope.startswith("TOP.") else args.scope
-    rows = [item.as_dict() for item in wave.header.scopes if not scope or item.path == scope or item.path.startswith(scope + ".")]
+    rows = [
+        item.as_dict() for item in wave.header.scopes
+        if (not scope or item.path == scope or item.path.startswith(scope + "."))
+        and (not args.match or all(term.lower() in item.path.lower() for term in args.match))
+    ]
+    suggestions = suggest_paths(scope or (args.match[-1] if args.match else None), (item.path for item in wave.header.scopes)) if not rows else []
     if args.json:
-        print(_json({"schema_version": SCHEMA_VERSION, "waveform": str(waveform), "scopes": rows}), end="")
+        print(_json({"schema_version": SCHEMA_VERSION, "waveform": str(waveform), "scopes": rows, "suggestions": suggestions}), end="")
     else:
         for row in rows:
             print(f"{row['path']} ({row['kind']})")
+        if suggestions:
+            print("no exact hierarchy match; suggestions: " + ", ".join(suggestions))
     return 0
 
 
 def _signals(args: argparse.Namespace) -> int:
     _workspace, waveform, output, _ = _paths(args)
     wave = open_waveform(waveform, skill_root(), output)
-    selected, truncated = select_signals(wave.header.signals, args.scope, args.match, limit=args.limit)
+    selected, truncated = select_signals(
+        wave.header.signals, scope=args.scope, matches=args.match, regexes=args.regex, limit=args.limit,
+    )
     result = {
         "schema_version": SCHEMA_VERSION,
         "waveform": str(waveform),
         "count": len(selected),
         "truncated": truncated,
+        "matching": {
+            "match": "case-insensitive literal substring; repeated --match terms are ANDed",
+            "regex": "case-insensitive regular expression; repeated --regex terms are ANDed",
+        },
+        "suggestions": suggest_paths(args.scope or ((args.match or args.regex)[-1] if args.match or args.regex else None), (signal.path for signal in wave.header.signals)) if not selected else [],
         "signals": [signal.as_dict() for signal in selected],
     }
     if args.json:
@@ -185,6 +238,8 @@ def _signals(args: argparse.Namespace) -> int:
             print(f"{signal.path} width={signal.width} kind={signal.kind}")
         if truncated:
             print(f"... truncated at --limit {args.limit}")
+        elif not selected and result["suggestions"]:
+            print("no signals matched; hierarchy suggestions: " + ", ".join(result["suggestions"]))
     return 0
 
 
@@ -222,12 +277,13 @@ def _probe(args: argparse.Namespace, save_packet: bool = False) -> int:
     if args.clock and args.clock not in explicit:
         explicit.append(args.clock)
     selected, signal_truncated = select_signals(
-        wave.header.signals, args.scope, args.match, explicit, args.max_signals
+        wave.header.signals, scope=args.scope, matches=args.match, regexes=args.regex,
+        paths=explicit, limit=args.max_signals,
     )
     if not selected:
         raise ValueError("probe selected no signals; use `signals` to discover paths")
     manifest = _manifest(args, workspace) if hasattr(args, "source") else SourceManifest([], [], [], [])
-    top, _ = _top(args, manifest, wave, waveform, False) if hasattr(args, "top") else (None, [])
+    top, top_candidates = _top(args, manifest, wave, waveform, False) if hasattr(args, "top") else (None, [])
     database = _authority_db(args, workspace, output, top)
     result = probe(wave, selected, start, end, args.max_changes, database, args.clock, args.edge)
     result["truncated"] = bool(result["truncated"] or signal_truncated)
@@ -238,6 +294,7 @@ def _probe(args: argparse.Namespace, save_packet: bool = False) -> int:
         "include_dirs": [str(path) for path in manifest.include_dirs],
         "defines": manifest.defines,
         "top": top,
+        "top_selection": _top_selection(args, top_candidates, top),
         "authority": authority_fingerprint(database),
     }
     if save_packet:
@@ -261,8 +318,19 @@ def _probe(args: argparse.Namespace, save_packet: bool = False) -> int:
     elif args.format == "json":
         print(_json(result), end="")
     else:
-        for change in result["changes"]:
-            print(f"{change['time']['display']:>10}  {change['signal']} = {change['value']}")
+        if args.view in {"changes", "both"}:
+            for change in result["changes"]:
+                print(f"{change['time']['display']:>10}  {change['signal']} = {change['value']}")
+        if args.view in {"snapshots", "both"}:
+            samples = result["clock_samples"]
+            if not args.clock:
+                raise ValueError("--view snapshots requires --clock")
+            if args.view == "both" and samples and result["changes"]:
+                print()
+            for sample in samples:
+                values = sample["values"]
+                rendered = "  ".join(f"{path}={values.get(path, '?')}" for path in sorted(values))
+                print(f"{sample['time']['display']:>10}  {rendered}")
         if result["truncated"]:
             print("... output truncated; narrow the query")
     return 0
@@ -293,7 +361,7 @@ def _compare(args: argparse.Namespace) -> int:
     bad_path = args.bad if args.bad.is_absolute() else workspace / args.bad
     good = open_waveform(good_path.resolve(), skill_root(), output)
     bad = open_waveform(bad_path.resolve(), skill_root(), output)
-    result = compare_waveforms(good, bad, args.scope, args.match, args.limit)
+    result = compare_waveforms(good, bad, args.scope, args.match, args.limit, args.regex)
     print(_json(result), end="")
     return 0
 
@@ -309,13 +377,18 @@ def _probe_parser(sub: Any, name: str, help_text: str, window_required: bool = T
     parser.add_argument("--end")
     parser.add_argument("--radius", default="100")
     parser.add_argument("--scope", "--focus-scope", dest="scope")
-    parser.add_argument("--match", action="append", default=[])
+    parser.add_argument("--match", action="append", default=[], help="case-insensitive literal substring (repeat to AND)")
+    parser.add_argument("--regex", action="append", default=[], help="case-insensitive regular expression (repeat to AND)")
     parser.add_argument("--signal", dest="signal_path", action="append", default=[])
     parser.add_argument("--clock")
     parser.add_argument("--edge", choices=("rising", "falling", "both"), default="rising")
     parser.add_argument("--max-signals", type=int, default=64)
     parser.add_argument("--max-changes", type=int, default=200)
     parser.add_argument("--format", choices=("json", "table"), default="json")
+    parser.add_argument(
+        "--view", choices=("changes", "snapshots", "both"), default="changes",
+        help="table output: change log, post-edge snapshots, or both (snapshots require --clock)",
+    )
     return parser
 
 
@@ -332,11 +405,13 @@ def build_parser() -> argparse.ArgumentParser:
     scopes = sub.add_parser("scopes", help="list waveform scopes")
     _add_wave_inputs(scopes)
     scopes.add_argument("--scope")
+    scopes.add_argument("--match", action="append", default=[], help="case-insensitive literal substring (repeat to AND)")
     scopes.add_argument("--json", action="store_true")
     signals = sub.add_parser("signals", help="discover waveform signals")
     _add_wave_inputs(signals)
     signals.add_argument("--scope")
-    signals.add_argument("--match", action="append", default=[])
+    signals.add_argument("--match", action="append", default=[], help="case-insensitive literal substring (repeat to AND)")
+    signals.add_argument("--regex", action="append", default=[], help="case-insensitive regular expression (repeat to AND)")
     signals.add_argument("--limit", type=int, default=100)
     signals.add_argument("--json", action="store_true")
     authority = sub.add_parser("authority", help="build elaborated RTL ownership when available, otherwise static candidates")
@@ -361,6 +436,7 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--out-dir", type=Path)
     compare.add_argument("--scope")
     compare.add_argument("--match", action="append", default=[])
+    compare.add_argument("--regex", action="append", default=[])
     compare.add_argument("--limit", type=int, default=64)
     return parser
 

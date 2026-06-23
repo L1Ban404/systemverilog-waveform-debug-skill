@@ -5,6 +5,7 @@ import heapq
 import json
 from pathlib import Path
 import re
+from difflib import SequenceMatcher
 from typing import Iterable
 
 from . import SCHEMA_VERSION
@@ -23,8 +24,13 @@ def select_signals(
     matches: list[str] | None = None,
     paths: list[str] | None = None,
     limit: int = 64,
+    regexes: list[str] | None = None,
 ) -> tuple[list[Signal], bool]:
     matches = [item.lower() for item in (matches or [])]
+    try:
+        patterns = [re.compile(item, re.I) for item in (regexes or [])]
+    except re.error as error:
+        raise ValueError(f"invalid --regex pattern: {error}") from error
     wanted = {canonical_path(item) for item in (paths or [])}
     normalized_scope = canonical_path(scope) if scope else None
     selected: list[Signal] = []
@@ -32,15 +38,38 @@ def select_signals(
         normalized = canonical_path(signal.path)
         explicit = normalized in wanted
         if not explicit:
-            if wanted and not matches:
+            if wanted and not matches and not patterns:
                 continue
             if normalized_scope and not (normalized == normalized_scope or normalized.startswith(normalized_scope + ".")):
                 continue
             if matches and not all(item in normalized.lower() for item in matches):
                 continue
+            if patterns and not all(pattern.search(normalized) for pattern in patterns):
+                continue
         selected.append(signal)
     selected.sort(key=lambda signal: signal.path)
     return selected[:limit], len(selected) > limit
+
+
+def suggest_paths(query: str | None, candidates: Iterable[str], limit: int = 5) -> list[str]:
+    """Rank likely elaborated hierarchy names without pretending they matched."""
+    if not query:
+        return []
+    normalized_query = canonical_path(query).lower()
+    query_parts = normalized_query.split(".")
+    scored: list[tuple[float, str]] = []
+    for candidate in sorted(set(candidates)):
+        normalized = canonical_path(candidate).lower()
+        parts = normalized.split(".")
+        score = max(
+            SequenceMatcher(None, normalized_query, normalized).ratio(),
+            SequenceMatcher(None, query_parts[-1], parts[-1]).ratio(),
+        )
+        # Shared hierarchy components are a useful signal for dut/u_dut-style names.
+        score += 0.15 * len(set(query_parts) & set(parts))
+        if score >= 0.35:
+            scored.append((score, candidate))
+    return [candidate for _score, candidate in sorted(scored, key=lambda row: (-row[0], row[1]))[:limit]]
 
 
 def infer_roles(signals: Iterable[Signal], limit: int = 20) -> list[dict[str, str]]:
@@ -205,9 +234,16 @@ def _series(wave: WaveBackend, signals: list[Signal]) -> dict[str, list[tuple[in
     return result
 
 
-def compare_waveforms(good: WaveBackend, bad: WaveBackend, scope: str | None, matches: list[str], limit: int) -> dict[str, object]:
-    good_selected, good_truncated = select_signals(good.header.signals, scope, matches, limit=limit)
-    bad_selected, bad_truncated = select_signals(bad.header.signals, scope, matches, limit=limit)
+def compare_waveforms(
+    good: WaveBackend, bad: WaveBackend, scope: str | None, matches: list[str], limit: int,
+    regexes: list[str] | None = None,
+) -> dict[str, object]:
+    good_selected, good_truncated = select_signals(
+        good.header.signals, scope=scope, matches=matches, regexes=regexes, limit=limit,
+    )
+    bad_selected, bad_truncated = select_signals(
+        bad.header.signals, scope=scope, matches=matches, regexes=regexes, limit=limit,
+    )
     good_by_path = {canonical_path(signal.path): signal for signal in good_selected}
     bad_by_path = {canonical_path(signal.path): signal for signal in bad_selected}
     shared = sorted(set(good_by_path) & set(bad_by_path))

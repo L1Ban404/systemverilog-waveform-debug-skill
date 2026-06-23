@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import re
@@ -40,7 +41,29 @@ def discover_files(root: Path, suffixes: set[str], excludes: list[str] | None = 
     )
 
 
-def resolve_waveform(workspace: Path, explicit: Path | None) -> tuple[Path, list[Path]]:
+def waveform_candidates(paths: list[Path]) -> list[dict[str, object]]:
+    """Return stable, user-facing provenance for discovered waveforms."""
+    return [
+        {
+            "path": str(path),
+            "modified_at": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(),
+            "mtime_ns": path.stat().st_mtime_ns,
+            "size_bytes": path.stat().st_size,
+        }
+        for path in paths
+    ]
+
+
+def render_waveform_candidates(paths: list[Path]) -> str:
+    return "; ".join(
+        f"{path} (modified {datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()})"
+        for path in paths
+    )
+
+
+def resolve_waveform(
+    workspace: Path, explicit: Path | None, *, allow_ambiguous: bool = False,
+) -> tuple[Path | None, list[Path]]:
     if explicit is not None:
         path = explicit if explicit.is_absolute() else workspace / explicit
         if not path.is_file() or path.suffix.lower() not in WAVE_SUFFIXES:
@@ -49,7 +72,14 @@ def resolve_waveform(workspace: Path, explicit: Path | None) -> tuple[Path, list
     candidates = discover_files(workspace, WAVE_SUFFIXES)
     if not candidates:
         raise ValueError(f"no .fst or .vcd waveform found under {workspace}")
-    return candidates[0], candidates
+    if len(candidates) == 1:
+        return candidates[0], candidates
+    if allow_ambiguous:
+        return None, candidates
+    raise ValueError(
+        "multiple waveform candidates found; pass --waveform explicitly. Candidates: "
+        + render_waveform_candidates(candidates)
+    )
 
 
 def _resolve_token(base: Path, token: str) -> Path:

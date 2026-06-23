@@ -16,7 +16,9 @@ python .codex/skills/systemverilog-waveform-debug-skill/scripts/wave_debug.py do
 python .codex/skills/systemverilog-waveform-debug-skill/scripts/wave_debug.py inspect --json
 ```
 
-Pass `--waveform`, `--source-root`, `--filelist`, and `--top` when discovery is ambiguous. Never silently choose among multiple plausible tops or traces.
+Pass `--waveform` when more than one trace exists. `inspect` will list every candidate with its UTC modification time and require an explicit choice; all waveform-reading commands likewise reject an ambiguous choice. Re-run the failing test first and use the waveform it just wrote—do not assume a pre-existing waveform belongs to the failure.
+
+`--top` is a source/elaboration option for `inspect`, `probe`, `packet`, and `authority`; `scopes` and `signals` intentionally do **not** accept it because they inspect the waveform's actual elaborated hierarchy. Use them first to discover `dut`/`u_dut`, generate, array, and struct paths.
 
 ## Investigate iteratively
 
@@ -34,8 +36,13 @@ python .codex/skills/systemverilog-waveform-debug-skill/scripts/wave_debug.py si
 ```bash
 python .codex/skills/systemverilog-waveform-debug-skill/scripts/wave_debug.py probe \
   --around 420ns --radius 30ns --scope tb.dut \
-  --match ready --signal tb.dut.clk --clock tb.dut.clk
+  --match ready --signal tb.dut.clk --clock tb.dut.clk \
+  --format table --view snapshots
 ```
+
+`--match` is a case-insensitive **literal substring**; repeated values are ANDed. It is not a regular expression, so `--match '<alternative-1>|<alternative-2>'` looks for those literal `|` characters. Use `--regex '<alternative-1>|<alternative-2>'` for alternatives. When a scope or signal query is empty, read its suggestions before widening the search.
+
+With `--clock`, JSON output includes post-delta `clock_samples`. In table mode, `--view snapshots` prints one full selected-signal state per requested clock edge (or use `--view both`); all probe timestamps use the waveform's single declared timescale unit.
 
 Use `--start/--end` for explicit windows and `--max-signals`/`--max-changes` to control evidence size. Preserve `X/Z`; never reinterpret them as zero.
 
@@ -58,6 +65,8 @@ Re-run `probe` with the same source/top options. `auto` selects Verilator elabor
 6. Form one causal hypothesis at a time. State what the next probe should show if it is true and what would falsify it. Narrow or extend the window only as evidence requires.
 
 Read [references/debug-methodology.md](references/debug-methodology.md) when reasoning about sequential timing, protocols, pipelines, memories, CDC, reset, or unknown propagation.
+
+For cocotb, run the one failing testcase with its normal waveform option, then pass the emitted path explicitly: `... inspect --waveform <path-written-by-failing-run> --json`. Keep the `results.xml` testcase name alongside the probe notes; it establishes failure provenance but does not prove that an older nearby waveform belongs to that result.
 
 ## Diagnose and fix
 
