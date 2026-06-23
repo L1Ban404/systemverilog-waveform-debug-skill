@@ -1,13 +1,30 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import re
 import sqlite3
-from .rtl_authority import build_rtl_authority
+
+from .rtl_authority import (
+    AUTHORITY_BACKEND,
+    AUTHORITY_LIMITATIONS,
+    AUTHORITY_MATCH_STATUS,
+    build_rtl_authority,
+)
 
 
 def build_authority(files: list[Path], top: str, output: Path, force: bool) -> None:
     build_rtl_authority(files, top, output, force)
+
+
+def authority_diagnostics() -> dict[str, object]:
+    return {
+        "available": True,
+        "backend": AUTHORITY_BACKEND,
+        "match_status": AUTHORITY_MATCH_STATUS,
+        "exact": False,
+        "limitations": list(AUTHORITY_LIMITATIONS),
+    }
 
 
 def _source_context(source_file: str | None, local_name: str | None, limit: int = 6) -> list[dict[str, object]]:
@@ -38,6 +55,7 @@ def lookup_authority(database: Path | None, paths: list[str]) -> dict[str, dict[
             name for name in (
                 "full_signal_name", "module_type", "instance_path", "local_signal_name",
                 "signal_kind", "direction", "decl_width_bits", "source_file", "provenance",
+                "match_status", "confidence",
             ) if name in columns
         ]
         rows = connection.execute(
@@ -47,7 +65,8 @@ def lookup_authority(database: Path | None, paths: list[str]) -> dict[str, dict[
     result: dict[str, dict[str, object]] = {}
     for row in rows:
         item = dict(row)
-        item["match_status"] = "exact"
+        item.setdefault("match_status", "legacy-authority")
+        item.setdefault("confidence", "unknown")
         item["source_context"] = _source_context(item.get("source_file"), item.get("local_signal_name"))
         result[str(item["full_signal_name"])] = item
         result[f"TOP.{item['full_signal_name']}"] = item
@@ -58,4 +77,15 @@ def authority_fingerprint(database: Path | None) -> dict[str, object] | None:
     if database is None or not database.is_file():
         return None
     stat = database.stat()
-    return {"path": str(database.resolve()), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+    result: dict[str, object] = {
+        "path": str(database.resolve()), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
+    }
+    try:
+        with sqlite3.connect(database) as connection:
+            metadata = dict(connection.execute("select key, value from authority_metadata"))
+        result.update({name: metadata[name] for name in ("schema_version", "backend", "match_status") if name in metadata})
+        if "limitations" in metadata:
+            result["limitations"] = json.loads(metadata["limitations"])
+    except (sqlite3.Error, json.JSONDecodeError):
+        result["schema_version"] = "legacy"
+    return result

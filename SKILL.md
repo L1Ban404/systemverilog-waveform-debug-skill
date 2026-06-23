@@ -53,7 +53,7 @@ python .codex/skills/systemverilog-waveform-debug-skill/scripts/wave_debug.py au
   --waveform bad.fst --filelist sim/files.f --top tb_top
 ```
 
-Re-run `probe` with the same source/top options. Treat `exact` authority as ownership evidence; treat `heuristic-text-match` source context only as navigation candidates.
+Re-run `probe` with the same source/top options. Treat `static-source-match` authority as an ownership candidate and verify it against waveform hierarchy for generate-, interface-, package-, or macro-heavy RTL. Treat `heuristic-text-match` source context only as a navigation candidate. Reserve `exact` for a future compiler-elaborated backend.
 
 6. Form one causal hypothesis at a time. State what the next probe should show if it is true and what would falsify it. Narrow or extend the window only as evidence requires.
 

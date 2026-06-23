@@ -8,8 +8,17 @@ from pathlib import Path
 import re
 import sqlite3
 
+from . import AUTHORITY_SCHEMA_VERSION
+
 
 IDENTIFIER = r"[A-Za-z_][A-Za-z0-9_$]*"
+AUTHORITY_BACKEND = "internal-static-parser"
+AUTHORITY_MATCH_STATUS = "static-source-match"
+AUTHORITY_LIMITATIONS = (
+    "conditional compilation and include expansion are not elaborated",
+    "generate conditions and instance arrays are represented only when textually discoverable",
+    "interfaces, packages, typedefs, and user-defined type widths may remain unresolved",
+)
 
 
 @dataclass(frozen=True)
@@ -18,12 +27,15 @@ class SignalDecl:
     kind: str
     direction: str | None
     width: int | None
+    range_text: str | None
 
 
 @dataclass(frozen=True)
 class InstanceDecl:
     module_type: str
     name: str
+    named_overrides: dict[str, str]
+    positional_overrides: tuple[str, ...]
 
 
 @dataclass
@@ -31,6 +43,8 @@ class ModuleDecl:
     name: str
     source_file: str
     parameters: dict[str, int]
+    parameter_order: tuple[str, ...]
+    parameter_expressions: dict[str, str]
     signals: list[SignalDecl]
     instances: list[InstanceDecl]
 
@@ -141,15 +155,27 @@ def _width(range_text: str | None, parameters: dict[str, int]) -> int | None:
     return result
 
 
-def _parameters(text: str) -> dict[str, int]:
-    result: dict[str, int] = {}
+def _parameter_definitions(text: str) -> dict[str, str]:
+    result: dict[str, str] = {}
     for part in _split_top_level(text):
         match = re.search(rf"\b(?:parameter|localparam)\b.*?\b({IDENTIFIER})\s*=\s*(.+)$", part, re.DOTALL)
         if not match:
             match = re.search(rf"^\s*({IDENTIFIER})\s*=\s*(.+)$", part, re.DOTALL)
-        if match and (value := _safe_int(match.group(2), result)) is not None:
-            result[match.group(1)] = value
+        if match:
+            result[match.group(1)] = match.group(2).strip()
     return result
+
+
+def _evaluate_parameter_definitions(definitions: dict[str, str]) -> tuple[dict[str, int], bool]:
+    result: dict[str, int] = {}
+    resolved = True
+    for name, expression in definitions.items():
+        value = _safe_int(expression, result)
+        if value is None:
+            resolved = False
+        else:
+            result[name] = value
+    return result, resolved
 
 
 def _declarations(text: str, parameters: dict[str, int], ansi: bool = False) -> list[SignalDecl]:
@@ -187,7 +213,7 @@ def _declarations(text: str, parameters: dict[str, int], ansi: bool = False) -> 
         cleaned = cleaned.split("=", 1)[0]
         names = re.findall(rf"\b({IDENTIFIER})\b", cleaned)
         if names:
-            result.append(SignalDecl(names[-1], kind, direction, _width(range_text, parameters)))
+            result.append(SignalDecl(names[-1], kind, direction, _width(range_text, parameters), range_text))
     return result
 
 
@@ -226,8 +252,12 @@ def parse_modules(files: list[Path]) -> dict[str, ModuleDecl]:
     for path in files:
         text = _without_comments(path.read_text(encoding="utf-8", errors="ignore"))
         for name, parameter_text, port_text, body in _module_blocks(text):
-            parameters = _parameters(parameter_text)
-            parameters.update(_parameters(",".join(re.findall(r"\b(?:localparam|parameter)\b[^;]*", body))))
+            header_definitions = _parameter_definitions(parameter_text)
+            body_definitions = _parameter_definitions(
+                ",".join(re.findall(r"\b(?:localparam|parameter)\b[^;]*", body))
+            )
+            parameter_expressions = {**header_definitions, **body_definitions}
+            parameters, _ = _evaluate_parameter_definitions(parameter_expressions)
             signals = _declarations(port_text, parameters, ansi=True)
             signals.extend(_declarations(body, parameters))
             unique: dict[str, SignalDecl] = {}
@@ -238,18 +268,71 @@ def parse_modules(files: list[Path]) -> dict[str, ModuleDecl]:
                     signal.kind,
                     signal.direction or (previous.direction if previous else None),
                     signal.width if signal.width is not None else (previous.width if previous else None),
+                    signal.range_text or (previous.range_text if previous else None),
                 )
-            module = ModuleDecl(name, str(path.resolve()), parameters, list(unique.values()), [])
+            module = ModuleDecl(
+                name,
+                str(path.resolve()),
+                parameters,
+                tuple(header_definitions),
+                parameter_expressions,
+                list(unique.values()),
+                [],
+            )
             modules[name] = module
             raw.append((module, body))
     module_names = set(modules)
     for module, body in raw:
-        instances: list[InstanceDecl] = []
-        for child in sorted(module_names, key=len, reverse=True):
-            instance_re = re.compile(rf"(?m)^\s*{re.escape(child)}\s*(?:#\s*\((?:[^()]|\([^()]*\))*\)\s*)?({IDENTIFIER})\s*(?:\[[^\]]+\]\s*)?\(")
-            instances.extend(InstanceDecl(child, match.group(1)) for match in instance_re.finditer(body))
-        module.instances = instances
+        module.instances = _parse_instances(body, module_names)
     return modules
+
+
+def _parse_instances(body: str, module_names: set[str]) -> list[InstanceDecl]:
+    instances: list[InstanceDecl] = []
+    module_pattern = "|".join(re.escape(name) for name in sorted(module_names, key=len, reverse=True))
+    if not module_pattern:
+        return instances
+    for match in re.finditer(rf"(?m)^\s*({module_pattern})\b", body):
+        module_type = match.group(1)
+        cursor = match.end()
+        while cursor < len(body) and body[cursor].isspace():
+            cursor += 1
+        override_text = ""
+        if cursor < len(body) and body[cursor] == "#":
+            cursor += 1
+            while cursor < len(body) and body[cursor].isspace():
+                cursor += 1
+            if cursor >= len(body) or body[cursor] != "(":
+                continue
+            try:
+                override_text, cursor = _balanced(body, cursor)
+            except ValueError:
+                continue
+        while cursor < len(body) and body[cursor].isspace():
+            cursor += 1
+        instance_match = re.match(IDENTIFIER, body[cursor:])
+        if not instance_match:
+            continue
+        name = instance_match.group(0)
+        cursor += instance_match.end()
+        while cursor < len(body) and body[cursor].isspace():
+            cursor += 1
+        if cursor < len(body) and body[cursor] == "[":
+            # An instance array needs elaboration to produce waveform paths such as u[0].
+            # Omitting it is safer than publishing a plausible but incorrect scalar path.
+            continue
+        if cursor >= len(body) or body[cursor] != "(":
+            continue
+        named: dict[str, str] = {}
+        positional: list[str] = []
+        for part in _split_top_level(override_text):
+            named_match = re.fullmatch(rf"\.({IDENTIFIER})\s*\((.*)\)", part, re.DOTALL)
+            if named_match:
+                named[named_match.group(1)] = named_match.group(2).strip()
+            elif part:
+                positional.append(part)
+        instances.append(InstanceDecl(module_type, name, named, tuple(positional)))
+    return instances
 
 
 def _authority_rows(modules: dict[str, ModuleDecl], top: str) -> list[dict[str, object]]:
@@ -257,11 +340,36 @@ def _authority_rows(modules: dict[str, ModuleDecl], top: str) -> list[dict[str, 
         raise ValueError(f"top module is not declared in the selected RTL sources: {top}")
     rows: list[dict[str, object]] = []
 
-    def visit(module_name: str, instance_path: str, ancestry: tuple[str, ...]) -> None:
+    def resolve_parameters(module: ModuleDecl, overrides: dict[str, int]) -> tuple[dict[str, int], bool]:
+        values: dict[str, int] = {}
+        resolved = True
+        for name, expression in module.parameter_expressions.items():
+            if name in overrides:
+                values[name] = overrides[name]
+                continue
+            value = _safe_int(expression, values)
+            if value is None:
+                resolved = False
+                if name in module.parameters:
+                    values[name] = module.parameters[name]
+            else:
+                values[name] = value
+        return values, resolved
+
+    def visit(
+        module_name: str,
+        instance_path: str,
+        ancestry: tuple[str, ...],
+        effective_parameters: dict[str, int] | None = None,
+        parameters_resolved: bool = True,
+    ) -> None:
         if module_name in ancestry:
             return
         module = modules[module_name]
+        parameters, defaults_resolved = resolve_parameters(module, effective_parameters or {})
+        parameters_resolved = parameters_resolved and defaults_resolved
         for signal in module.signals:
+            width = _width(signal.range_text, parameters)
             rows.append({
                 "full_signal_name": f"{instance_path}.{signal.name}",
                 "module_type": module.name,
@@ -269,12 +377,41 @@ def _authority_rows(modules: dict[str, ModuleDecl], top: str) -> list[dict[str, 
                 "local_signal_name": signal.name,
                 "signal_kind": signal.kind,
                 "direction": signal.direction,
-                "decl_width_bits": signal.width,
+                "decl_width_bits": width if width is not None else signal.width,
                 "source_file": module.source_file,
-                "provenance": "internal-rtl-parser",
+                "provenance": AUTHORITY_BACKEND,
+                "match_status": AUTHORITY_MATCH_STATUS,
+                "confidence": "medium" if parameters_resolved and width is not None else "low",
             })
         for instance in module.instances:
-            visit(instance.module_type, f"{instance_path}.{instance.name}", ancestry + (module_name,))
+            child = modules[instance.module_type]
+            child_overrides: dict[str, int] = {}
+            child_resolved = parameters_resolved
+            for index, expression in enumerate(instance.positional_overrides):
+                if index >= len(child.parameter_order):
+                    child_resolved = False
+                    continue
+                value = _safe_int(expression, parameters)
+                if value is None:
+                    child_resolved = False
+                else:
+                    child_overrides[child.parameter_order[index]] = value
+            for name, expression in instance.named_overrides.items():
+                if name not in child.parameter_order:
+                    child_resolved = False
+                    continue
+                value = _safe_int(expression, parameters)
+                if value is None:
+                    child_resolved = False
+                else:
+                    child_overrides[name] = value
+            visit(
+                instance.module_type,
+                f"{instance_path}.{instance.name}",
+                ancestry + (module_name,),
+                child_overrides,
+                child_resolved,
+            )
 
     visit(top, top, ())
     return rows
@@ -284,7 +421,7 @@ def _identity(files: list[Path], top: str) -> dict[str, object]:
     sources = []
     for path in files:
         sources.append({"path": str(path.resolve()), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
-    return {"engine": "internal-rtl-authority-v1", "top": top, "sources": sources}
+    return {"engine": f"{AUTHORITY_BACKEND}-v2", "top": top, "sources": sources}
 
 
 def build_rtl_authority(files: list[Path], top: str, output: Path, force: bool = False) -> None:
@@ -300,8 +437,23 @@ def build_rtl_authority(files: list[Path], top: str, output: Path, force: bool =
     modules = parse_modules(files)
     rows = _authority_rows(modules, top)
     output.mkdir(parents=True, exist_ok=True)
-    table = {"schema_version": "1", "top": top, "signals": rows}
-    index = {"schema_version": "1", "top": top, "signals": {str(row["full_signal_name"]): row for row in rows}}
+    authority_info = {
+        "backend": AUTHORITY_BACKEND,
+        "match_status": AUTHORITY_MATCH_STATUS,
+        "limitations": list(AUTHORITY_LIMITATIONS),
+    }
+    table = {
+        "schema_version": AUTHORITY_SCHEMA_VERSION,
+        "top": top,
+        "authority": authority_info,
+        "signals": rows,
+    }
+    index = {
+        "schema_version": AUTHORITY_SCHEMA_VERSION,
+        "top": top,
+        "authority": authority_info,
+        "signals": {str(row["full_signal_name"]): row for row in rows},
+    }
     (output / "rtl_authority_table.json").write_text(json.dumps(table, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (output / "rtl_authority_index.json").write_text(json.dumps(index, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     database = output / "rtl_authority.sqlite3"
@@ -311,12 +463,24 @@ def build_rtl_authority(files: list[Path], top: str, output: Path, force: bool =
         connection.execute(
             "create table authority_lookup (full_signal_name text primary key, module_type text not null, "
             "instance_path text not null, local_signal_name text not null, signal_kind text, direction text, "
-            "decl_width_bits integer, source_file text, provenance text not null)"
+            "decl_width_bits integer, source_file text, provenance text not null, "
+            "match_status text not null, confidence text not null)"
         )
         connection.executemany(
             "insert into authority_lookup values (:full_signal_name, :module_type, :instance_path, "
-            ":local_signal_name, :signal_kind, :direction, :decl_width_bits, :source_file, :provenance)", rows,
+            ":local_signal_name, :signal_kind, :direction, :decl_width_bits, :source_file, :provenance, "
+            ":match_status, :confidence)", rows,
         )
         connection.execute("create index authority_instance_path on authority_lookup(instance_path)")
+        connection.execute("create table authority_metadata (key text primary key, value text not null)")
+        connection.executemany(
+            "insert into authority_metadata values (?, ?)",
+            (
+                ("schema_version", AUTHORITY_SCHEMA_VERSION),
+                ("backend", AUTHORITY_BACKEND),
+                ("match_status", AUTHORITY_MATCH_STATUS),
+                ("limitations", json.dumps(AUTHORITY_LIMITATIONS)),
+            ),
+        )
     temporary.replace(database)
     metadata.write_text(json.dumps(identity, indent=2, sort_keys=True) + "\n", encoding="utf-8")

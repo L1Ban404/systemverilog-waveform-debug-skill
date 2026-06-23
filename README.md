@@ -4,7 +4,7 @@
 
 A Codex skill and portable CLI for evidence-driven Verilog/SystemVerilog debugging from VCD or FST waveforms.
 
-Version 0.2 turns waveform analysis into an iterative investigation: discover hierarchy and signals, query compact windows, compare good and bad traces, map activity to RTL ownership, test hypotheses, and close the loop with an authorized RTL fix and regression.
+Version 0.3 turns waveform analysis into an iterative investigation: discover hierarchy and signals, query compact windows, compare good and bad traces, map activity to RTL ownership, test hypotheses, and close the loop with an authorized RTL fix and regression.
 
 ## Capabilities
 
@@ -71,9 +71,11 @@ VCD requires only Python 3.10 or newer. FST uses the first available path:
 2. a compatible installed `pywellen` on other platforms;
 3. `fst2vcd`, commonly provided by GTKWave or OSS CAD Suite.
 
-`doctor --json` reports exact capabilities and remediation. RTL hierarchy authority is built by this repository's internal parser, so installation does not require nested Git submodules.
+`doctor --json` reports backend provenance, runtime ABI, capabilities, and remediation. RTL hierarchy authority is built by this repository's internal parser, so installation does not require nested Git submodules. Its results are labeled `static-source-match`: useful ownership candidates, but not equivalent to compiler elaboration for complex generate, interface, package, or preprocessor-heavy designs.
 
 The bundled `pywellen` component is distributed under BSD-3-Clause; see `third_party/pywellen/LICENSE`.
+
+Authority JSON and SQLite metadata use the same `0.3` schema version. The JSON contract is published in `schemas/authority.schema.json`; consumers should reject unsupported versions instead of guessing field semantics.
 
 ## Development
 

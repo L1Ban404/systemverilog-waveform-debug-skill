@@ -64,10 +64,10 @@ def main() -> int:
             ).strip()
         )
         packet = json.loads(packet_path.read_text(encoding="utf-8"))
-        assert packet["schema_version"] == "0.2"
+        assert packet["schema_version"] == "0.3"
         signals = packet["signals"]
         assert len(signals) == 3
-        assert all(signal["rtl"]["match_status"] == "exact" for signal in signals)
+        assert all(signal["rtl"]["match_status"] == "static-source-match" for signal in signals)
 
         evidence = json.loads(
             run(

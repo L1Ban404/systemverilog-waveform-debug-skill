@@ -6,9 +6,11 @@ import importlib
 import json
 import os
 from pathlib import Path
+import platform
 import shutil
 import subprocess
 import sys
+import sysconfig
 from typing import Iterator
 
 from . import SCHEMA_VERSION
@@ -59,11 +61,38 @@ def _load_pywellen(skill_root: Path):
 
 
 def pywellen_available(skill_root: Path) -> tuple[bool, str | None]:
+    diagnostics = pywellen_diagnostics(skill_root)
+    error = diagnostics.get("error")
+    return bool(diagnostics["available"]), str(error) if error is not None else None
+
+
+def pywellen_diagnostics(skill_root: Path) -> dict[str, object]:
     try:
         module = _load_pywellen(skill_root)
     except Exception as error:  # pragma: no cover - defensive ABI diagnostic
-        return False, str(error)
-    return (module is not None, None if module is not None else "module not importable")
+        module = None
+        load_error: str | None = str(error)
+    else:
+        load_error = None if module is not None else "module not importable"
+    module_file = Path(str(getattr(module, "__file__", ""))).resolve() if module is not None else None
+    bundled_root = (skill_root / "third_party/pywellen").resolve()
+    bundled = bool(module_file and (module_file == bundled_root or bundled_root in module_file.parents))
+    native_files = sorted(str(path) for path in module_file.parent.glob("*.so")) if module_file else []
+    return {
+        "available": module is not None,
+        "backend": "pywellen",
+        "source": "bundled" if bundled else "installed" if module is not None else None,
+        "module_path": str(module_file) if module_file else None,
+        "native_extensions": native_files,
+        "runtime": {
+            "implementation": sys.implementation.name,
+            "python": platform.python_version(),
+            "soabi": sysconfig.get_config_var("SOABI"),
+            "machine": platform.machine(),
+            "platform": sys.platform,
+        },
+        "error": load_error,
+    }
 
 
 def _pywellen_can_open(path: Path, module: object) -> bool:

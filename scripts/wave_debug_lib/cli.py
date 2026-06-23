@@ -10,10 +10,10 @@ from typing import Any
 
 from . import SCHEMA_VERSION, TOOL_VERSION
 from .analysis import cache_key, compare_waveforms, infer_roles, probe, select_signals, signal_value
-from .authority import authority_fingerprint, build_authority
+from .authority import authority_diagnostics, authority_fingerprint, build_authority
 from .project import SourceManifest, infer_top, module_candidates, resolve_waveform, source_manifest
 from .vcd import parse_time
-from .wave import open_waveform, pywellen_available
+from .wave import open_waveform, pywellen_diagnostics
 
 
 def skill_root() -> Path:
@@ -83,20 +83,20 @@ def _authority_db(args: argparse.Namespace, workspace: Path, output: Path, top: 
 
 def _doctor(as_json: bool) -> int:
     root = skill_root()
-    pywellen, pywellen_error = pywellen_available(root)
+    pywellen = pywellen_diagnostics(root)
     result = {
         "schema_version": SCHEMA_VERSION,
         "python": {"version": sys.version.split()[0], "supported_vcd": sys.version_info >= (3, 10)},
         "capabilities": {
             "vcd": {"available": True, "backend": "python-vcd"},
-            "fst_direct": {"available": pywellen, "backend": "pywellen", "error": pywellen_error},
+            "fst_direct": pywellen,
             "fst_conversion": {"available": shutil.which("fst2vcd") is not None, "path": shutil.which("fst2vcd")},
-            "rtl_authority": {"available": True, "backend": "internal-rtl-parser"},
+            "rtl_authority": authority_diagnostics(),
         },
         "ready": sys.version_info >= (3, 10),
         "remediation": [],
     }
-    if not pywellen and shutil.which("fst2vcd") is None:
+    if not pywellen["available"] and shutil.which("fst2vcd") is None:
         result["remediation"].append("install a compatible pywellen or fst2vcd to read FST waveforms")
     if as_json:
         print(_json(result), end="")
@@ -336,7 +336,7 @@ def build_parser() -> argparse.ArgumentParser:
     signals.add_argument("--match", action="append", default=[])
     signals.add_argument("--limit", type=int, default=100)
     signals.add_argument("--json", action="store_true")
-    authority = sub.add_parser("authority", help="build exact RTL hierarchy ownership")
+    authority = sub.add_parser("authority", help="build static RTL hierarchy ownership candidates")
     _add_wave_inputs(authority)
     _add_source_inputs(authority)
     authority.add_argument("--force", action="store_true")

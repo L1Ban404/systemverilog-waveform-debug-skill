@@ -131,7 +131,7 @@ def probe(
         row = signal.as_dict()
         row["value_before_start"] = initial.get(signal.id_code)
         rtl = _rtl_info(signal.path, authority, authority_db is not None)
-        if rtl.get("match_status") == "exact" and rtl.get("decl_width_bits") is not None:
+        if rtl.get("match_status") not in {None, "unresolved"} and rtl.get("decl_width_bits") is not None:
             rtl["width_status"] = "match" if int(rtl["decl_width_bits"]) == signal.width else "mismatch"
         row["rtl"] = rtl
         signal_rows.append(row)

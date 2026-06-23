@@ -25,6 +25,15 @@ def invoke(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[s
 
 
 class CliTests(unittest.TestCase):
+    def test_doctor_reports_backend_provenance_and_authority_confidence(self) -> None:
+        result = json.loads(invoke("doctor", "--json").stdout)
+        direct = result["capabilities"]["fst_direct"]
+        self.assertIn(direct["source"], {"bundled", "installed", None})
+        self.assertIn("soabi", direct["runtime"])
+        authority = result["capabilities"]["rtl_authority"]
+        self.assertEqual(authority["match_status"], "static-source-match")
+        self.assertFalse(authority["exact"])
+
     def test_waveform_only_probe_is_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -86,6 +95,24 @@ class CliTests(unittest.TestCase):
         self.assertIn((0, "handshake_tb.rst_n", "x"), changes)
         self.assertIn((10, "handshake_tb.valid", "1"), changes)
         self.assertIn((15, "handshake_tb.data", "00100010"), changes)
+
+    def test_probe_preserves_static_authority_confidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            common = (
+                "--workspace", str(ROOT / "tests/fixtures"), "--waveform", str(FIXTURE),
+                "--out-dir", str(output), "--top", "top_tb",
+            )
+            invoke("authority", *common)
+            result = json.loads(
+                invoke("probe", *common, "--scope", "top_tb.u_dut", "--start", "0", "--end", "20").stdout
+            )
+            self.assertTrue(result["signals"])
+            self.assertTrue(all(row["rtl"]["match_status"] == "static-source-match" for row in result["signals"]))
+            self.assertTrue(all(row["rtl"]["width_status"] == "match" for row in result["signals"]))
+            authority = result["provenance"]["authority"]
+            self.assertEqual(authority["schema_version"], "0.3")
+            self.assertTrue(authority["limitations"])
 
 
 if __name__ == "__main__":

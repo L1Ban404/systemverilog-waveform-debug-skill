@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/L1Ban404/systemverilog-waveform-debug-skill/schemas/authority.schema.json",
+  "title": "RTL authority table",
+  "type": "object",
+  "required": ["schema_version", "top", "authority", "signals"],
+  "properties": {
+    "schema_version": {"const": "0.3"},
+    "top": {"type": "string", "minLength": 1},
+    "authority": {
+      "type": "object",
+      "required": ["backend", "match_status", "limitations"],
+      "properties": {
+        "backend": {"type": "string"},
+        "match_status": {
+          "enum": ["exact", "static-source-match", "legacy-authority"]
+        },
+        "limitations": {
+          "type": "array",
+          "items": {"type": "string"}
+        }
+      },
+      "additionalProperties": true
+    },
+    "signals": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/signal"}
+    }
+  },
+  "$defs": {
+    "signal": {
+      "type": "object",
+      "required": [
+        "full_signal_name",
+        "module_type",
+        "instance_path",
+        "local_signal_name",
+        "provenance",
+        "match_status",
+        "confidence"
+      ],
+      "properties": {
+        "full_signal_name": {"type": "string"},
+        "module_type": {"type": "string"},
+        "instance_path": {"type": "string"},
+        "local_signal_name": {"type": "string"},
+        "signal_kind": {"type": ["string", "null"]},
+        "direction": {"type": ["string", "null"]},
+        "decl_width_bits": {"type": ["integer", "null"], "minimum": 1},
+        "source_file": {"type": ["string", "null"]},
+        "provenance": {"type": "string"},
+        "match_status": {
+          "enum": ["exact", "static-source-match", "legacy-authority"]
+        },
+        "confidence": {"enum": ["high", "medium", "low", "unknown"]}
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}
