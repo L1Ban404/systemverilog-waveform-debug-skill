@@ -11,10 +11,11 @@ Version 0.4 turns waveform analysis into an iterative investigation: discover hi
 - Pure Python 3.10+ streaming VCD metadata and change queries
 - FST through compatible `pywellen` or cached `fst2vcd` conversion
 - Waveform-only scope, signal, point, and bounded-window queries
-- Physical time units and clock-edge samples
+- Physical time units, phase-limited clock-edge samples, and four-state-safe radix display
 - Good/bad trace first-divergence analysis
 - Verilog/SystemVerilog discovery plus `.f/.flist`, include, define, and exclude inputs
 - RTL hierarchy authority and source-navigation context
+- Portable simulation provenance manifests and reviewable Markdown evidence reports
 - Bounded JSON evidence designed for an LLM context window
 
 The adapter is simulator- and architecture-independent.
@@ -49,9 +50,23 @@ python "$CLI" probe --around 420ns --radius 30ns \
 
 Waveform auto-discovery is deliberately conservative: if more than one `.fst` or `.vcd` exists, `inspect` lists paths, sizes, and UTC modification times but does not select one. Other waveform-reading commands require `--waveform PATH` in that case. Re-run the failure first; never assume a pre-existing waveform belongs to that run.
 
-`--match` is a case-insensitive literal substring and repeated terms are ANDed. To match alternatives, use `--regex '<alternative-1>|<alternative-2>'`. Empty `scopes` and `signals` results include fuzzy hierarchy suggestions. `--top` is accepted by source/elaboration commands (`inspect`, `probe`, `packet`, `authority`), not `scopes` or `signals`, which always expose the waveform's real elaborated paths.
+`--match` is a case-insensitive literal substring and repeated terms are ANDed. To match local-name alternatives, use `--name-regex '<alternative-1>|<alternative-2>'`; use `--path-regex` for full paths. Empty `scopes` and `signals` results include fuzzy hierarchy suggestions. `--top` is accepted by source/elaboration commands (`inspect`, `probe`, `packet`, `authority`), not `scopes` or `signals`, which always expose the waveform's real elaborated paths.
 
-`probe --clock ...` returns post-delta clock-edge snapshots in JSON; `--format table --view snapshots` makes those rows directly readable. All timestamps in a probe use the waveform's declared timescale unit.
+`probe --clock ...` returns waveform-observed clock-edge snapshots in JSON; `--format table --view snapshots` makes those rows directly readable. All timestamps in a probe use the waveform's declared timescale unit.
+
+`probe --radix auto` preserves 1-bit four-state logic, uses hexadecimal for known buses, and falls back to exact `0b...` when a bus contains mixed `X/Z`; JSON always retains `value_bits`. Snapshot output is explicitly `waveform-observed`: offline VCD/FST does not identify Active, NBA, or Postponed event regions. Requests for those phases fail until the simulation supplies phase-aware instrumentation.
+
+Signal filters are explicit: `--match` and `--name-regex` target local names, while `--path-match` and `--path-regex` target full hierarchy paths. Traversal is recursive by default; add `--no-recursive` to stay in the selected scope.
+
+Record the run context alongside the waveform:
+
+```bash
+python "$CLI" provenance --waveform <waveform-from-failing-run> \
+  --simulator <simulator> --simulation-command '<reproducible-command>' \
+  --out build/wave-debug/provenance.json
+```
+
+Use `compare --align reset-deassert --align-signal <path>` or `--align clock-edge --align-signal <path>` when traces do not share a time origin. Add `--report evidence.md --inference '...' --hypothesis '...'` to `probe` for a compact Markdown evidence report.
 
 Map selected activity back to RTL:
 
@@ -78,7 +93,7 @@ VCD requires only Python 3.10 or newer. FST uses the first available path:
 2. a compatible installed `pywellen` on other platforms;
 3. `fst2vcd`, commonly provided by GTKWave or OSS CAD Suite.
 
-`doctor --json` reports backend provenance, runtime ABI, capabilities, and remediation. RTL authority defaults to `auto`: it uses Verilator's elaborated JSON when the installed Verilator supports `--json-only`, labeling the result `exact` with high confidence. Use `--authority-backend static` for the internal no-dependency fallback; it is labeled `static-source-match` and is useful for ownership candidates, but not equivalent to compiler elaboration for complex generate, interface, package, or preprocessor-heavy designs. An explicit `--authority-backend verilator` never silently falls back.
+`doctor --json` reports backend provenance, runtime ABI, capabilities, and remediation. RTL authority defaults to `auto`: it uses Verilator's elaborated JSON when the installed Verilator supports `--json-only`, labeling the result `exact` with high confidence. Pass the simulation's `--filelist`, `--include`, `--define`, and `--parameter NAME=VALUE` inputs (or `--provenance-file`) so elaboration has the same context. Use `--authority-backend static` for the internal no-dependency fallback; it is labeled `static-source-match` and is useful for ownership candidates, but not equivalent to compiler elaboration for complex generate, interface, package, or preprocessor-heavy designs. Probe mappings additionally normalize these states as `elaborated-exact`, `static-candidate`, or `heuristic-context`. An explicit `--authority-backend verilator` never silently falls back.
 
 ### Recommended: install Verilator locally
 

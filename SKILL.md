@@ -20,6 +20,16 @@ Pass `--waveform` when more than one trace exists. `inspect` will list every can
 
 `--top` is a source/elaboration option for `inspect`, `probe`, `packet`, and `authority`; `scopes` and `signals` intentionally do **not** accept it because they inspect the waveform's actual elaborated hierarchy. Use them first to discover `dut`/`u_dut`, generate, array, and struct paths.
 
+Capture provenance when a failure is produced. The manifest is framework-neutral and records waveform identity/timescale, simulator details, sources, filelists, includes, defines, parameter overrides, command, and optional failure locator:
+
+```bash
+python .codex/skills/systemverilog-waveform-debug-skill/scripts/wave_debug.py provenance \
+  --waveform <waveform-from-failing-run> --top <top> --filelist <filelist> \
+  --simulator <simulator> --simulator-version <version> \
+  --simulation-command '<reproducible-command>' --failure-label '<failure-label>' \
+  --out build/wave-debug/provenance.json
+```
+
 ## Investigate iteratively
 
 1. Establish waveform provenance, timescale, clocks, resets, failure time, and the first incorrect externally visible signal.
@@ -40,9 +50,13 @@ python .codex/skills/systemverilog-waveform-debug-skill/scripts/wave_debug.py pr
   --format table --view snapshots
 ```
 
-`--match` is a case-insensitive **literal substring**; repeated values are ANDed. It is not a regular expression, so `--match '<alternative-1>|<alternative-2>'` looks for those literal `|` characters. Use `--regex '<alternative-1>|<alternative-2>'` for alternatives. When a scope or signal query is empty, read its suggestions before widening the search.
+`--match` is a case-insensitive **literal substring**; repeated values are ANDed. It is not a regular expression, so `--match '<alternative-1>|<alternative-2>'` looks for those literal `|` characters. Use `--name-regex '<alternative-1>|<alternative-2>'` for local-name alternatives or `--path-regex` for full paths. When a scope or signal query is empty, read its suggestions before widening the search.
 
-With `--clock`, JSON output includes post-delta `clock_samples`. In table mode, `--view snapshots` prints one full selected-signal state per requested clock edge (or use `--view both`); all probe timestamps use the waveform's single declared timescale unit.
+For unambiguous filtering, `--match`/`--name-regex` apply to local signal names; `--path-match`/`--path-regex` apply to full elaborated paths; `--regex` remains a full-path alias. Scope traversal is recursive by default; use `--no-recursive` to restrict signals to the named scope.
+
+`probe` defaults to `--radix auto`: 1-bit logic stays `0/1/X/Z`, known buses use hex, and buses with mixed `X/Z` use exact `0b...` bit strings. Every formatted event also has `value_bits` in JSON. Do not discard it.
+
+With `--clock`, JSON output includes `waveform-observed` clock samples; in table mode, `--view snapshots` prints one selected-signal state per requested edge (or use `--view both`). Offline VCD/FST cannot prove Active/NBA/Postponed ordering. `pre-edge`, `post-active`, `post-nba`, and `postponed` therefore require simulator-time instrumentation and are rejected rather than guessed.
 
 Use `--start/--end` for explicit windows and `--max-signals`/`--max-changes` to control evidence size. Preserve `X/Z`; never reinterpret them as zero.
 
@@ -53,6 +67,8 @@ python .codex/skills/systemverilog-waveform-debug-skill/scripts/wave_debug.py co
   --scope tb.dut --match state
 ```
 
+Use `--align reset-deassert --align-signal <path>` or `--align clock-edge --align-signal <path>` when trace starts or reset lengths differ. Use absolute alignment only when the two runs share the same time origin.
+
 5. Build RTL authority only when source mapping is needed:
 
 ```bash
@@ -62,11 +78,24 @@ python .codex/skills/systemverilog-waveform-debug-skill/scripts/wave_debug.py au
 
 Re-run `probe` with the same source/top options. `auto` selects Verilator elaboration when its JSON interface is available; only its `exact` result is compiler-elaborated, and it must use the same sources, include paths, defines, and top as the simulation. Treat `static-source-match` authority as an ownership candidate and verify it against waveform hierarchy for generate-, interface-, package-, or macro-heavy RTL. Use `--authority-backend verilator` to require elaboration or `static` to require the portable fallback. Treat `heuristic-text-match` source context only as a navigation candidate.
 
+Pass the same `--filelist`, `--include`, `--define`, and `--parameter NAME=VALUE` inputs used for simulation, or reuse them with `--provenance-file <manifest>`. Verilator elaboration applies parameter overrides; the static backend records them but remains a `static-candidate`. Probe mappings expose the normalized tier `elaborated-exact`, `static-candidate`, or `heuristic-context` in addition to backend-specific metadata.
+
 6. Form one causal hypothesis at a time. State what the next probe should show if it is true and what would falsify it. Narrow or extend the window only as evidence requires.
 
 Read [references/debug-methodology.md](references/debug-methodology.md) when reasoning about sequential timing, protocols, pipelines, memories, CDC, reset, or unknown propagation.
 
 For cocotb, run the one failing testcase with its normal waveform option, then pass the emitted path explicitly: `... inspect --waveform <path-written-by-failing-run> --json`. Keep the `results.xml` testcase name alongside the probe notes; it establishes failure provenance but does not prove that an older nearby waveform belongs to that result.
+
+When handing off an investigation, write a small report rather than recounting a terminal dump:
+
+```bash
+python .codex/skills/systemverilog-waveform-debug-skill/scripts/wave_debug.py probe \
+  --waveform <waveform-from-failing-run> --start <start> --end <end> \
+  --report build/wave-debug/evidence.md \
+  --inference '<interpretation>' --hypothesis '<falsifiable claim>'
+```
+
+The report keeps Observed evidence separate from user-supplied Inferred and Hypothesis statements.
 
 ## Diagnose and fix
 

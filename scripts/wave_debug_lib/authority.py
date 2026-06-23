@@ -14,20 +14,28 @@ from .rtl_authority import (
 from .elaboration import VERILATOR_BACKEND, VERILATOR_MATCH_STATUS, build_verilator_authority, verilator_diagnostics
 
 
+def mapping_confidence(match_status: str) -> str:
+    """Stable user-facing authority tier, independent of backend internals."""
+    return {
+        "exact": "elaborated-exact",
+        "static-source-match": "static-candidate",
+    }.get(match_status, "heuristic-context")
+
+
 def build_authority(
     files: list[Path], top: str, output: Path, force: bool, backend: str = "auto",
-    include_dirs: list[Path] | None = None, defines: list[str] | None = None,
+    include_dirs: list[Path] | None = None, defines: list[str] | None = None, parameters: list[str] | None = None,
 ) -> str:
     if backend not in {"auto", "verilator", "static"}:
         raise ValueError(f"unsupported authority backend: {backend}")
     if backend in {"auto", "verilator"}:
         try:
-            build_verilator_authority(files, top, output, force, include_dirs, defines)
+            build_verilator_authority(files, top, output, force, include_dirs, defines, parameters)
             return VERILATOR_BACKEND
         except RuntimeError:
             if backend == "verilator":
                 raise
-    build_rtl_authority(files, top, output, force, include_dirs, defines)
+    build_rtl_authority(files, top, output, force, include_dirs, defines, parameters)
     return AUTHORITY_BACKEND
 
 
@@ -89,6 +97,7 @@ def lookup_authority(database: Path | None, paths: list[str]) -> dict[str, dict[
         item = dict(row)
         item.setdefault("match_status", "legacy-authority")
         item.setdefault("confidence", "unknown")
+        item["mapping_confidence"] = mapping_confidence(str(item["match_status"]))
         item["source_context"] = _source_context(item.get("source_file"), item.get("local_signal_name"))
         result[str(item["full_signal_name"])] = item
         result[f"TOP.{item['full_signal_name']}"] = item

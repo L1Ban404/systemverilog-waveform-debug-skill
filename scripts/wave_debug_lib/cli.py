@@ -12,6 +12,8 @@ from . import SCHEMA_VERSION, TOOL_VERSION
 from .analysis import cache_key, compare_waveforms, infer_roles, probe, select_signals, signal_value, suggest_paths
 from .authority import authority_diagnostics, authority_fingerprint, build_authority
 from .project import SourceManifest, infer_top, module_candidates, resolve_waveform, source_manifest, waveform_candidates
+from .provenance import build_provenance, read_provenance, write_provenance
+from .report import write_probe_report
 from .vcd import parse_time
 from .wave import open_waveform, pywellen_diagnostics
 
@@ -38,6 +40,23 @@ def _add_source_inputs(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--define", action="append", default=[])
     parser.add_argument("--exclude", action="append", default=[])
     parser.add_argument("--top")
+    parser.add_argument("--parameter", action="append", default=[], help="parameter override recorded in provenance")
+    parser.add_argument("--simulator", help="simulator name recorded in provenance")
+    parser.add_argument("--simulator-version", help="simulator version recorded in provenance")
+    parser.add_argument("--simulation-command", help="reproducible simulation command recorded in provenance")
+    parser.add_argument("--failure-time", help="failure time recorded in provenance")
+    parser.add_argument("--failure-label", help="assertion, testcase, or external failure label")
+    parser.add_argument("--provenance-file", type=Path, help="read a previously generated provenance manifest")
+
+
+def _add_match_inputs(parser: argparse.ArgumentParser, *, recursive: bool = True) -> None:
+    parser.add_argument("--match", action="append", default=[], help="case-insensitive literal substring of the local signal name (repeat to AND)")
+    parser.add_argument("--name-regex", action="append", default=[], help="case-insensitive regular expression of the local signal name")
+    parser.add_argument("--path-match", action="append", default=[], help="case-insensitive literal substring of the full hierarchy path")
+    parser.add_argument("--path-regex", action="append", default=[], help="case-insensitive regular expression of the full hierarchy path")
+    parser.add_argument("--regex", action="append", default=[], help="deprecated alias for --path-regex")
+    if recursive:
+        parser.add_argument("--recursive", action=argparse.BooleanOptionalAction, default=True, help="include descendant scopes (default: recursive)")
 
 
 def _paths(args: argparse.Namespace) -> tuple[Path, Path, Path, list[Path]]:
@@ -50,6 +69,7 @@ def _paths(args: argparse.Namespace) -> tuple[Path, Path, Path, list[Path]]:
 
 
 def _manifest(args: argparse.Namespace, workspace: Path) -> SourceManifest:
+    _apply_provenance_inputs(args, workspace)
     return source_manifest(
         workspace,
         getattr(args, "source_root", None),
@@ -59,6 +79,40 @@ def _manifest(args: argparse.Namespace, workspace: Path) -> SourceManifest:
         getattr(args, "define", []),
         getattr(args, "exclude", []),
     )
+
+
+def _apply_provenance_inputs(args: argparse.Namespace, workspace: Path) -> None:
+    """Fill omitted compilation context from an explicit portable manifest."""
+    path = getattr(args, "provenance_file", None)
+    if not path or getattr(args, "_provenance_applied", False):
+        return
+    resolved = path if path.is_absolute() else workspace / path
+    payload = read_provenance(resolved)
+    compilation = payload.get("compilation", {})
+    simulation = payload.get("simulation", {})
+    failure = payload.get("failure", {})
+    if not args.source and not args.filelist:
+        args.source = [Path(item) for item in compilation.get("source_files", [])]
+    if not args.include:
+        args.include = [Path(item) for item in compilation.get("include_dirs", [])]
+    if not args.define:
+        args.define = list(compilation.get("defines", []))
+    if not args.parameter:
+        args.parameter = list(compilation.get("parameter_overrides", []))
+    if not args.top:
+        args.top = compilation.get("top")
+    if not args.simulator:
+        args.simulator = simulation.get("simulator")
+    if not args.simulator_version:
+        args.simulator_version = simulation.get("simulator_version")
+    if not args.simulation_command:
+        args.simulation_command = simulation.get("command")
+    if not args.failure_time:
+        args.failure_time = failure.get("time")
+    if not args.failure_label:
+        args.failure_label = failure.get("label")
+    args.provenance_file = resolved
+    args._provenance_applied = True
 
 
 def _top(args: argparse.Namespace, manifest: SourceManifest, wave: Any, waveform: Path, required: bool) -> tuple[str | None, list[str]]:
@@ -90,6 +144,31 @@ def _authority_db(args: argparse.Namespace, workspace: Path, output: Path, top: 
         if candidate.is_file():
             return candidate
     return None
+
+
+def _run_provenance(args: argparse.Namespace, wave: Any, manifest: SourceManifest, top: str | None) -> dict[str, object]:
+    current = build_provenance(
+        wave, manifest, top,
+        simulator=getattr(args, "simulator", None),
+        simulator_version=getattr(args, "simulator_version", None),
+        simulation_command=getattr(args, "simulation_command", None),
+        parameter_overrides=getattr(args, "parameter", []),
+        failure_time=getattr(args, "failure_time", None),
+        failure_label=getattr(args, "failure_label", None),
+    )
+    supplied_path = getattr(args, "provenance_file", None)
+    if not supplied_path:
+        return {"current": current, "provided": None}
+    supplied = read_provenance(supplied_path)
+    supplied_wave = str(supplied["waveform"].get("path", ""))
+    return {
+        "current": current,
+        "provided": {
+            "path": str(supplied_path.resolve()),
+            "waveform_matches_current": supplied_wave == current["waveform"]["path"],
+            "record": supplied,
+        },
+    }
 
 
 def _doctor(as_json: bool) -> int:
@@ -171,6 +250,7 @@ def _inspect(args: argparse.Namespace) -> int:
         "selected_top": selected_top,
         "top_selection": _top_selection(args, top_candidates, selected_top),
         "role_candidates": infer_roles(wave.header.signals),
+        "provenance": _run_provenance(args, wave, manifest, selected_top),
         "output_dir": str(output),
     }
     if args.json:
@@ -197,10 +277,19 @@ def _scopes(args: argparse.Namespace) -> int:
     _workspace, waveform, output, _ = _paths(args)
     wave = open_waveform(waveform, skill_root(), output)
     scope = args.scope[4:] if args.scope and args.scope.startswith("TOP.") else args.scope
+
+    def in_scope(item: Any) -> bool:
+        if not scope:
+            return True
+        if args.recursive:
+            return item.path == scope or item.path.startswith(scope + ".")
+        return item.path == scope or item.parent == scope
+
     rows = [
         item.as_dict() for item in wave.header.scopes
-        if (not scope or item.path == scope or item.path.startswith(scope + "."))
-        and (not args.match or all(term.lower() in item.path.lower() for term in args.match))
+        if in_scope(item)
+        and (not args.match or all(term.lower() in item.local_name.lower() for term in args.match))
+        and (not args.path_match or all(term.lower() in item.path.lower() for term in args.path_match))
     ]
     suggestions = suggest_paths(scope or (args.match[-1] if args.match else None), (item.path for item in wave.header.scopes)) if not rows else []
     if args.json:
@@ -217,7 +306,9 @@ def _signals(args: argparse.Namespace) -> int:
     _workspace, waveform, output, _ = _paths(args)
     wave = open_waveform(waveform, skill_root(), output)
     selected, truncated = select_signals(
-        wave.header.signals, scope=args.scope, matches=args.match, regexes=args.regex, limit=args.limit,
+        wave.header.signals, scope=args.scope, matches=args.match, regexes=args.regex,
+        name_regexes=args.name_regex, path_matches=args.path_match, path_regexes=args.path_regex,
+        recursive=args.recursive, limit=args.limit,
     )
     result = {
         "schema_version": SCHEMA_VERSION,
@@ -225,8 +316,11 @@ def _signals(args: argparse.Namespace) -> int:
         "count": len(selected),
         "truncated": truncated,
         "matching": {
-            "match": "case-insensitive literal substring; repeated --match terms are ANDed",
-            "regex": "case-insensitive regular expression; repeated --regex terms are ANDed",
+            "match": "case-insensitive local signal-name substring; repeated terms are ANDed",
+            "name_regex": "case-insensitive local signal-name regular expression",
+            "path_match": "case-insensitive full hierarchy-path substring",
+            "path_regex": "case-insensitive full hierarchy-path regular expression; --regex is an alias",
+            "recursive": args.recursive,
         },
         "suggestions": suggest_paths(args.scope or ((args.match or args.regex)[-1] if args.match or args.regex else None), (signal.path for signal in wave.header.signals)) if not selected else [],
         "signals": [signal.as_dict() for signal in selected],
@@ -257,7 +351,7 @@ def _signal(args: argparse.Namespace) -> int:
     timestamp = parse_time(args.time, wave.header.timescale)
     result = signal_value(
         wave, _resolve_signal(wave, args.signal_path), timestamp,
-        _authority_db(args, workspace, output, None),
+        _authority_db(args, workspace, output, None), args.radix,
     )
     print(_json(result), end="")
     return 0
@@ -278,14 +372,18 @@ def _probe(args: argparse.Namespace, save_packet: bool = False) -> int:
         explicit.append(args.clock)
     selected, signal_truncated = select_signals(
         wave.header.signals, scope=args.scope, matches=args.match, regexes=args.regex,
-        paths=explicit, limit=args.max_signals,
+        name_regexes=args.name_regex, path_matches=args.path_match, path_regexes=args.path_regex,
+        recursive=args.recursive, paths=explicit, limit=args.max_signals,
     )
     if not selected:
         raise ValueError("probe selected no signals; use `signals` to discover paths")
     manifest = _manifest(args, workspace) if hasattr(args, "source") else SourceManifest([], [], [], [])
     top, top_candidates = _top(args, manifest, wave, waveform, False) if hasattr(args, "top") else (None, [])
     database = _authority_db(args, workspace, output, top)
-    result = probe(wave, selected, start, end, args.max_changes, database, args.clock, args.edge)
+    result = probe(
+        wave, selected, start, end, args.max_changes, database, args.clock, args.edge,
+        args.radix, args.sample_phase,
+    )
     result["truncated"] = bool(result["truncated"] or signal_truncated)
     result["provenance"] = {
         "source_file_count": len(manifest.files),
@@ -296,7 +394,15 @@ def _probe(args: argparse.Namespace, save_packet: bool = False) -> int:
         "top": top,
         "top_selection": _top_selection(args, top_candidates, top),
         "authority": authority_fingerprint(database),
+        "run_manifest": _run_provenance(args, wave, manifest, top),
     }
+    if args.report:
+        report_path = args.report if args.report.is_absolute() else workspace / args.report
+        write_probe_report(
+            report_path, result, args.inference, args.hypothesis,
+            " ".join([Path(sys.argv[0]).name, args.command]),
+        )
+        result["report"] = str(report_path)
     if save_packet:
         source_identity = []
         for path in manifest.files:
@@ -327,6 +433,8 @@ def _probe(args: argparse.Namespace, save_packet: bool = False) -> int:
                 raise ValueError("--view snapshots requires --clock")
             if args.view == "both" and samples and result["changes"]:
                 print()
+            if not samples:
+                print(f"<clock snapshots {result['clock_samples_status']}>")
             for sample in samples:
                 values = sample["values"]
                 rendered = "  ".join(f"{path}={values.get(path, '?')}" for path in sorted(values))
@@ -347,8 +455,22 @@ def _authority(args: argparse.Namespace) -> int:
     destination = output / "authority" / top
     build_authority(
         manifest.files, top, destination, args.force, args.authority_backend,
-        manifest.include_dirs, manifest.defines,
+        manifest.include_dirs, manifest.defines, args.parameter,
     )
+    print(destination)
+    return 0
+
+
+def _provenance(args: argparse.Namespace) -> int:
+    workspace, waveform, output, _ = _paths(args)
+    wave = open_waveform(waveform, skill_root(), output)
+    manifest = _manifest(args, workspace)
+    top, _ = _top(args, manifest, wave, waveform, False)
+    payload = _run_provenance(args, wave, manifest, top)["current"]
+    assert isinstance(payload, dict)
+    destination = args.out or output / "provenance.json"
+    destination = destination if destination.is_absolute() else workspace / destination
+    write_provenance(destination, payload)
     print(destination)
     return 0
 
@@ -361,7 +483,10 @@ def _compare(args: argparse.Namespace) -> int:
     bad_path = args.bad if args.bad.is_absolute() else workspace / args.bad
     good = open_waveform(good_path.resolve(), skill_root(), output)
     bad = open_waveform(bad_path.resolve(), skill_root(), output)
-    result = compare_waveforms(good, bad, args.scope, args.match, args.limit, args.regex)
+    result = compare_waveforms(
+        good, bad, args.scope, args.match, args.limit, args.regex,
+        args.align, args.align_signal, args.align_occurrence,
+    )
     print(_json(result), end="")
     return 0
 
@@ -377,14 +502,22 @@ def _probe_parser(sub: Any, name: str, help_text: str, window_required: bool = T
     parser.add_argument("--end")
     parser.add_argument("--radius", default="100")
     parser.add_argument("--scope", "--focus-scope", dest="scope")
-    parser.add_argument("--match", action="append", default=[], help="case-insensitive literal substring (repeat to AND)")
-    parser.add_argument("--regex", action="append", default=[], help="case-insensitive regular expression (repeat to AND)")
+    _add_match_inputs(parser)
     parser.add_argument("--signal", dest="signal_path", action="append", default=[])
     parser.add_argument("--clock")
     parser.add_argument("--edge", choices=("rising", "falling", "both"), default="rising")
     parser.add_argument("--max-signals", type=int, default=64)
     parser.add_argument("--max-changes", type=int, default=200)
     parser.add_argument("--format", choices=("json", "table"), default="json")
+    parser.add_argument("--radix", choices=("auto", "hex", "bin", "dec", "signed"), default="auto")
+    parser.add_argument(
+        "--sample-phase", choices=("waveform-observed", "pre-edge", "post-active", "post-nba", "postponed"),
+        default="waveform-observed",
+        help="snapshot phase; offline VCD/FST currently supports waveform-observed only",
+    )
+    parser.add_argument("--report", type=Path, help="write a reviewable Markdown evidence report")
+    parser.add_argument("--inference", action="append", default=[], help="explicit interpretation to include in the report")
+    parser.add_argument("--hypothesis", action="append", default=[], help="explicit unproven hypothesis to include in the report")
     parser.add_argument(
         "--view", choices=("changes", "snapshots", "both"), default="changes",
         help="table output: change log, post-edge snapshots, or both (snapshots require --clock)",
@@ -405,13 +538,12 @@ def build_parser() -> argparse.ArgumentParser:
     scopes = sub.add_parser("scopes", help="list waveform scopes")
     _add_wave_inputs(scopes)
     scopes.add_argument("--scope")
-    scopes.add_argument("--match", action="append", default=[], help="case-insensitive literal substring (repeat to AND)")
+    _add_match_inputs(scopes)
     scopes.add_argument("--json", action="store_true")
     signals = sub.add_parser("signals", help="discover waveform signals")
     _add_wave_inputs(signals)
     signals.add_argument("--scope")
-    signals.add_argument("--match", action="append", default=[], help="case-insensitive literal substring (repeat to AND)")
-    signals.add_argument("--regex", action="append", default=[], help="case-insensitive regular expression (repeat to AND)")
+    _add_match_inputs(signals)
     signals.add_argument("--limit", type=int, default=100)
     signals.add_argument("--json", action="store_true")
     authority = sub.add_parser("authority", help="build elaborated RTL ownership when available, otherwise static candidates")
@@ -419,10 +551,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_source_inputs(authority)
     authority.add_argument("--force", action="store_true")
     authority.add_argument("--authority-backend", choices=("auto", "verilator", "static"), default="auto")
+    provenance = sub.add_parser("provenance", help="write a portable waveform and simulation-context manifest")
+    _add_wave_inputs(provenance)
+    _add_source_inputs(provenance)
+    provenance.add_argument("--out", type=Path, help="manifest destination (default: build/wave-debug/provenance.json)")
     signal = sub.add_parser("signal", help="query one signal at a timestamp")
     _add_wave_inputs(signal)
     signal.add_argument("--signal", required=True, dest="signal_path")
     signal.add_argument("--time", required=True)
+    signal.add_argument("--radix", choices=("auto", "hex", "bin", "dec", "signed"), default="auto")
     signal.add_argument("--window-len", help=argparse.SUPPRESS)
     signal.add_argument("--authority-db", type=Path)
     _probe_parser(sub, "probe", "query a compact bounded evidence window")
@@ -438,6 +575,9 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--match", action="append", default=[])
     compare.add_argument("--regex", action="append", default=[])
     compare.add_argument("--limit", type=int, default=64)
+    compare.add_argument("--align", choices=("absolute", "reset-deassert", "clock-edge"), default="absolute")
+    compare.add_argument("--align-signal", help="full waveform path used for non-absolute alignment")
+    compare.add_argument("--align-occurrence", type=int, default=1, help="one-based matching reset release or clock edge")
     return parser
 
 
@@ -455,6 +595,8 @@ def main(argv: list[str] | None = None) -> int:
             return _signals(args)
         if args.command == "authority":
             return _authority(args)
+        if args.command == "provenance":
+            return _provenance(args)
         if args.command == "signal":
             return _signal(args)
         if args.command == "probe":

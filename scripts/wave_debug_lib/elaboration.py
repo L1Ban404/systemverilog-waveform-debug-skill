@@ -132,13 +132,13 @@ def _elaborated_rows(netlist: dict[str, Any], files: list[Path], top: str) -> li
 
 def build_verilator_authority(
     files: list[Path], top: str, output: Path, force: bool = False,
-    include_dirs: list[Path] | None = None, defines: list[str] | None = None,
+    include_dirs: list[Path] | None = None, defines: list[str] | None = None, parameters: list[str] | None = None,
 ) -> None:
     diagnostics = verilator_diagnostics()
     executable = diagnostics.get("path")
     if not isinstance(executable, str) or not diagnostics["available"]:
         raise RuntimeError("Verilator JSON elaboration is unavailable; upgrade Verilator or use --authority-backend static")
-    identity = authority_identity(files, top, VERILATOR_BACKEND, include_dirs, defines)
+    identity = authority_identity(files, top, VERILATOR_BACKEND, include_dirs, defines, parameters)
     # Do not invoke the compiler when an identical, complete authority cache already exists.
     if not force and authority_cache_matches(output, identity):
         return
@@ -150,6 +150,7 @@ def build_verilator_authority(
         ]
         command.extend(f"-I{path}" for path in include_dirs or [])
         command.extend(f"-D{definition}" for definition in defines or [])
+        command.extend(f"-G{parameter}" for parameter in parameters or [])
         command.extend(str(path) for path in files)
         completed = subprocess.run(command, text=True, capture_output=True, check=False)
         if completed.returncode or not json_path.is_file():
@@ -164,6 +165,7 @@ def build_verilator_authority(
             "match_status": VERILATOR_MATCH_STATUS,
             "limitations": list(VERILATOR_LIMITATIONS),
             "tool": {"path": executable, "version": diagnostics.get("version")},
+            "parameter_overrides": list(parameters or []),
         },
         force,
     )

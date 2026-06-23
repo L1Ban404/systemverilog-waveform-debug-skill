@@ -421,7 +421,7 @@ def _authority_rows(modules: dict[str, ModuleDecl], top: str) -> list[dict[str, 
 
 def authority_identity(
     files: list[Path], top: str, backend: str, include_dirs: list[Path] | None = None,
-    defines: list[str] | None = None,
+    defines: list[str] | None = None, parameters: list[str] | None = None,
 ) -> dict[str, object]:
     sources = []
     for path in files:
@@ -430,6 +430,7 @@ def authority_identity(
         "engine": f"{backend}-v3", "top": top, "sources": sources,
         "include_dirs": [str(path.resolve()) for path in include_dirs or []],
         "defines": list(defines or []),
+        "parameter_overrides": list(parameters or []),
     }
 
 
@@ -508,9 +509,9 @@ def write_authority_artifacts(
 
 def build_rtl_authority(
     files: list[Path], top: str, output: Path, force: bool = False,
-    include_dirs: list[Path] | None = None, defines: list[str] | None = None,
+    include_dirs: list[Path] | None = None, defines: list[str] | None = None, parameters: list[str] | None = None,
 ) -> None:
-    identity = authority_identity(files, top, AUTHORITY_BACKEND, include_dirs, defines)
+    identity = authority_identity(files, top, AUTHORITY_BACKEND, include_dirs, defines, parameters)
     if not force and authority_cache_matches(output, identity):
         return
     modules = parse_modules(files)
@@ -519,6 +520,7 @@ def build_rtl_authority(
         "backend": AUTHORITY_BACKEND,
         "match_status": AUTHORITY_MATCH_STATUS,
         "limitations": list(AUTHORITY_LIMITATIONS),
+        "parameter_overrides": list(parameters or []),
     }
     write_authority_artifacts(
         rows, top, output,

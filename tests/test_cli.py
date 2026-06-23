@@ -70,7 +70,7 @@ class CliTests(unittest.TestCase):
         common = ("--workspace", str(ROOT / "tests/fixtures"), "--waveform", str(FIXTURE), "--json")
         literal = json.loads(invoke("signals", *common, "--match", "valid|clk").stdout)
         self.assertEqual(literal["count"], 0)
-        self.assertEqual(literal["matching"]["match"], "case-insensitive literal substring; repeated --match terms are ANDed")
+        self.assertEqual(literal["matching"]["match"], "case-insensitive local signal-name substring; repeated terms are ANDed")
         regex = json.loads(invoke("signals", *common, "--regex", "valid|clk").stdout)
         self.assertGreaterEqual(regex["count"], 2)
         scopes = json.loads(invoke("scopes", *common, "--scope", "top_tb.dut").stdout)
@@ -128,10 +128,75 @@ class CliTests(unittest.TestCase):
                 "--start", "0ns", "--end", "20ns", "--max-changes", "40",
             ).stdout
         )
-        changes = {(row["time"]["ticks"], row["signal"], row["value"]) for row in result["changes"]}
-        self.assertIn((0, "handshake_tb.rst_n", "x"), changes)
-        self.assertIn((10, "handshake_tb.valid", "1"), changes)
-        self.assertIn((15, "handshake_tb.data", "00100010"), changes)
+        changes = {(row["time"]["ticks"], row["signal"], row["value"], row["value_bits"]) for row in result["changes"]}
+        self.assertIn((0, "handshake_tb.rst_n", "x", "x"), changes)
+        self.assertIn((10, "handshake_tb.valid", "1", "1"), changes)
+        self.assertIn((15, "handshake_tb.data", "0x22", "00100010"), changes)
+        self.assertIn((0, "handshake_tb.data", "0bxxxxxxxx", "xxxxxxxx"), changes)
+        self.assertEqual(result["sampling"]["phase"], "waveform-observed")
+
+    def test_matching_provenance_report_and_phase_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "provenance.json"
+            invoke(
+                "provenance", "--workspace", str(ROOT / "tests/fixtures"), "--waveform", str(FIXTURE),
+                "--simulator", "example-sim", "--parameter", "WIDTH=8", "--failure-label", "example-failure",
+                "--out", str(manifest),
+            )
+            provenance = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertEqual(provenance["schema_version"], "1.0")
+            self.assertEqual(provenance["compilation"]["parameter_overrides"], ["WIDTH=8"])
+            inspected = json.loads(invoke(
+                "inspect", "--workspace", str(ROOT / "tests/fixtures"), "--waveform", str(FIXTURE),
+                "--provenance-file", str(manifest), "--json",
+            ).stdout)
+            self.assertTrue(inspected["provenance"]["provided"]["waveform_matches_current"])
+            authority_dir = Path(invoke(
+                "authority", "--workspace", str(ROOT / "tests/fixtures"), "--waveform", str(FIXTURE),
+                "--provenance-file", str(manifest), "--authority-backend", "static", "--out-dir", str(root / "authority"),
+            ).stdout.strip())
+            self.assertTrue((authority_dir / "rtl_authority.sqlite3").is_file())
+            direct = json.loads(invoke(
+                "signals", "--workspace", str(ROOT / "tests/fixtures"), "--waveform", str(FIXTURE),
+                "--scope", "top_tb", "--no-recursive", "--path-regex", r"^top_tb\.", "--json",
+            ).stdout)
+            self.assertEqual({row["scope"] for row in direct["signals"]}, {"top_tb"})
+            report = root / "evidence.md"
+            invoke(
+                "probe", "--workspace", str(ROOT / "tests/fixtures"), "--waveform", str(FIXTURE),
+                "--scope", "top_tb.u_dut", "--start", "0", "--end", "20", "--report", str(report),
+                "--inference", "recorded interpretation", "--hypothesis", "recorded hypothesis",
+            )
+            text = report.read_text(encoding="utf-8")
+            self.assertIn("## Observed", text)
+            self.assertIn("recorded hypothesis", text)
+            phase = invoke(
+                "probe", "--workspace", str(ROOT / "tests/fixtures"), "--waveform", str(FIXTURE),
+                "--scope", "top_tb", "--start", "0", "--end", "1", "--sample-phase", "post-nba", check=False,
+            )
+            self.assertEqual(phase.returncode, 2)
+            self.assertIn("requires simulator-time instrumentation", phase.stderr)
+
+    def test_compare_can_align_clock_edges(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            good = root / "good.vcd"
+            bad = root / "bad.vcd"
+            source = FIXTURE.read_text(encoding="utf-8")
+            good.write_text(source, encoding="utf-8")
+            shifted = source
+            for timestamp in (20, 15, 10, 5, 0):
+                shifted = shifted.replace(f"#{timestamp}\n", f"#{timestamp + 20}\n")
+            bad.write_text(shifted, encoding="utf-8")
+            absolute = json.loads(invoke("compare", str(good), str(bad), "--workspace", str(root)).stdout)
+            self.assertIsNotNone(absolute["first_divergence"])
+            aligned = json.loads(invoke(
+                "compare", str(good), str(bad), "--workspace", str(root),
+                "--align", "clock-edge", "--align-signal", "top_tb.clk",
+            ).stdout)
+            self.assertIsNone(aligned["first_divergence"])
+            self.assertEqual(aligned["alignment"]["mode"], "clock-edge")
 
     def test_probe_preserves_static_authority_confidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
