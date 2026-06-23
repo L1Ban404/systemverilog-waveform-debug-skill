@@ -73,6 +73,18 @@ VCD requires only Python 3.10 or newer. FST uses the first available path:
 
 `doctor --json` reports backend provenance, runtime ABI, capabilities, and remediation. RTL authority defaults to `auto`: it uses Verilator's elaborated JSON when the installed Verilator supports `--json-only`, labeling the result `exact` with high confidence. Use `--authority-backend static` for the internal no-dependency fallback; it is labeled `static-source-match` and is useful for ownership candidates, but not equivalent to compiler elaboration for complex generate, interface, package, or preprocessor-heavy designs. An explicit `--authority-backend verilator` never silently falls back.
 
+### Recommended: install Verilator locally
+
+For parameterized, macro-heavy, or generate-heavy RTL, install a recent local Verilator so `authority --authority-backend auto` can produce compiler-elaborated `exact` mappings. Verify that the installed version exposes the required JSON interface:
+
+```bash
+verilator --version
+verilator --help | grep -- --json-only
+python "$CLI" doctor --json
+```
+
+On Debian/Ubuntu, `sudo apt install verilator` is a convenient starting point; use a newer upstream or OSS CAD Suite build when the packaged version does not list `--json-only`. The tool continues to work without Verilator through `--authority-backend static`.
+
 The bundled `pywellen` component is distributed under BSD-3-Clause; see `third_party/pywellen/LICENSE`.
 
 Authority JSON and SQLite metadata use the same `0.4` schema version. The JSON contract is published in `schemas/authority.schema.json`; consumers should reject unsupported versions instead of guessing field semantics. Authority files and cache metadata are written atomically, while cache identity includes the selected backend, sources, include paths, and definitions.
